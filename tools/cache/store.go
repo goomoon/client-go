@@ -59,6 +59,7 @@ type Store interface {
 	// GetByKey returns the accumulator associated with the given key
 	GetByKey(key string) (item interface{}, exists bool, err error)
 
+	//全量替换Store缓存内容，外界不应该再引用数组内容(包括查询和写入)
 	// Replace will delete the contents of the store, using instead the
 	// given list. Store takes ownership of the list, you should not reference
 	// it after calling this function.

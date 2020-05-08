@@ -118,6 +118,16 @@ func NewDeltaFIFOWithOptions(opts DeltaFIFOOptions) *DeltaFIFO {
 	return f
 }
 
+/**
+DeltaFIFO是一个生产者与消费者的队列，其中Reflector是生产者，消费者调用Pop()的方法。
+
+DeltaFIFO主要用在以下场景：
+
+希望对象变更最多处理一次
+处理对象时，希望查看自上次处理对象以来发生的所有事情
+要处理对象的删除
+希望定期重新处理对象
+*/
 // DeltaFIFO is like FIFO, but differs in two ways.  One is that the
 // accumulator associated with a given object's key is not that object
 // but rather a Deltas, which is a slice of Delta values for that
@@ -160,6 +170,7 @@ type DeltaFIFO struct {
 	lock sync.RWMutex
 	cond sync.Cond
 
+	// 保存各个Key与对象事件列表的映射关系，同个Key可能前后多个事件都会有缓存(相邻2个del事件会合并)，取数据时一般取最新一个
 	// We depend on the property that items in the set are in
 	// the queue and vice versa, and that all Deltas in this
 	// map have at least one Delta.
@@ -172,6 +183,7 @@ type DeltaFIFO struct {
 	// initialPopulationCount is the number of items inserted by the first call of Replace()
 	initialPopulationCount int
 
+	//获取各个元素的标识函数
 	// keyFunc is used to make the key used for queued item
 	// insertion and retrieval, and should be deterministic.
 	keyFunc KeyFunc
@@ -213,6 +225,7 @@ func (f *DeltaFIFO) Close() {
 // KeyOf exposes f's keyFunc, but also detects the key of a Deltas object or
 // DeletedFinalStateUnknown objects.
 func (f *DeltaFIFO) KeyOf(obj interface{}) (string, error) {
+	//如果是列表，则取最新的一个
 	if d, ok := obj.(Deltas); ok {
 		if len(d) == 0 {
 			return "", KeyError{obj, ErrZeroLengthDeltasObject}
@@ -332,10 +345,13 @@ func dedupDeltas(deltas Deltas) Deltas {
 	}
 	a := &deltas[n-1]
 	b := &deltas[n-2]
+
+	//如果最后2个有一个是删除事件，则返回前n-2个，外加非删除那个，如果都是删除的则返回最后一个事件
 	if out := isDup(a, b); out != nil {
 		d := append(Deltas{}, deltas[:n-2]...)
 		return append(d, *out)
 	}
+	//最后2个有一个不是删除操作，则返回原有全量
 	return deltas
 }
 
@@ -371,15 +387,19 @@ func (f *DeltaFIFO) queueActionLocked(actionType DeltaType, obj interface{}) err
 	}
 
 	newDeltas := append(f.items[id], Delta{actionType, obj})
+
+	//去除重复的删除事件(对比后2个操作)
 	newDeltas = dedupDeltas(newDeltas)
 
 	if len(newDeltas) > 0 {
+		//如果items对应该key原先为空，则更新queue和items列表(针对增量情况下，新增情况)
 		if _, exists := f.items[id]; !exists {
 			f.queue = append(f.queue, id)
 		}
 		f.items[id] = newDeltas
 		f.cond.Broadcast()
 	} else {
+		//貌似从代码逻辑上看不会出现
 		// This never happens, because dedupDeltas never returns an empty list
 		// when given a non-empty list (as it is here).
 		// But if somehow it ever does return an empty list, then
@@ -600,6 +620,7 @@ func (f *DeltaFIFO) Resync() error {
 		return nil
 	}
 
+	//获取item里面所有的Key，并逐个同步
 	keys := f.knownObjects.ListKeys()
 	for _, k := range keys {
 		if err := f.syncKeyLocked(k); err != nil {
@@ -609,7 +630,11 @@ func (f *DeltaFIFO) Resync() error {
 	return nil
 }
 
+/**
+同步每个Key
+*/
 func (f *DeltaFIFO) syncKeyLocked(key string) error {
+	//获取key对象的事件列表，从items里面取值
 	obj, exists, err := f.knownObjects.GetByKey(key)
 	if err != nil {
 		klog.Errorf("Unexpected error %v during lookup of key %v, unable to queue object for sync", err, key)
@@ -619,6 +644,7 @@ func (f *DeltaFIFO) syncKeyLocked(key string) error {
 		return nil
 	}
 
+	// 获取对象标识(最新一个对象的标识)
 	// If we are doing Resync() and there is already an event queued for that object,
 	// we ignore the Resync for it. This is to avoid the race, in which the resync
 	// comes with the previous value of object (since queueing an event for the object
@@ -627,10 +653,12 @@ func (f *DeltaFIFO) syncKeyLocked(key string) error {
 	if err != nil {
 		return KeyError{obj, err}
 	}
+	// #谷月 为何又拿对应的key从items里面取值一遍，有则返回？
 	if len(f.items[id]) > 0 {
 		return nil
 	}
 
+	//没有的话，则更新操作事件列表
 	if err := f.queueActionLocked(Sync, obj); err != nil {
 		return fmt.Errorf("couldn't queue object: %v", err)
 	}
@@ -678,7 +706,9 @@ const (
 // [*] Unless the change is a deletion, and then you'll get the final
 //     state of the object before it was deleted.
 type Delta struct {
-	Type   DeltaType
+	//最后一个操作
+	Type DeltaType
+	//操作后的最新的对象
 	Object interface{}
 }
 

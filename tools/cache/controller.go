@@ -35,17 +35,27 @@ import (
 // https://github.com/kubernetes/client-go/tree/master/examples/workqueue
 // .
 
-// Config contains all the settings for one of these low-level controllers.
+// Config contains all the settings for one of these low-level controllers.informer Contoller配置
 type Config struct {
+
 	// The queue for your objects - has to be a DeltaFIFO due to
 	// assumptions in the implementation. Your Process() function
 	// should accept the output of this Queue's Pop() method.
+	// Controller配置的存储，也就是informer对应的Delta Fifo
 	Queue
 
 	// Something that can list and watch your objects.
 	ListerWatcher
 
-	// Something that can process a popped Deltas.
+	/**
+	  Inform Controller 对应处理器，将refelect变更事件封装成通知添加到转发到informer.processor上，而后者将其添加到各个listener的addChan队列中；(第2步)
+	  整个处理过程如下：
+	  1. refelect是由informer controller所初始化用于跟etcd做交付
+	  2. 然后由该controller将refelect事件添加到informer.processor下面的listener的addChan队列中
+	  3. 然后有另外的协程负责将listenter addChan队列数据弹出放到listener nextChan队列中；
+	  4. 有另外协程负责取出listener nextChan队列数据，调用listener下面的handler处理业务(其由各个CustomController注入)
+	*/
+	// Something that can process your objects.具体处理逻辑参见【Process: s.HandleDeltas,】
 	Process ProcessFunc
 
 	// ObjectType is an example object of the type this controller is
@@ -84,7 +94,9 @@ type ProcessFunc func(obj interface{}) error
 
 // `*controller` implements Controller
 type controller struct {
-	config         Config
+	//controller对应的配置，其对口sharedIndexInformer的配置
+	config Config
+	//构建对应的reflector，进行对etcd的缓存
 	reflector      *Reflector
 	reflectorMutex sync.RWMutex
 	clock          clock.Clock
@@ -118,7 +130,10 @@ func New(c *Config) Controller {
 	return ctlr
 }
 
-// Run begins processing items, and will continue until a value is sent down stopCh or it is closed.
+/**
+1. 构造Reflector，
+*/
+// Run begins processing items, and will continue until a value is sent down stopCh.
 // It's an error to call Run more than once.
 // Run blocks; call via go.
 func (c *controller) Run(stopCh <-chan struct{}) {
@@ -127,6 +142,8 @@ func (c *controller) Run(stopCh <-chan struct{}) {
 		<-stopCh
 		c.config.Queue.Close()
 	}()
+
+	//获取sharedIndexInformer对应的配置，构建对应的Reflector，其会通过ListAndWatch接口，对缩关注的ObjectType，持续跟踪，并保存到对应存储Queue上(即Delta Fifo上)
 	r := NewReflector(
 		c.config.ListerWatcher,
 		c.config.ObjectType,
@@ -146,8 +163,10 @@ func (c *controller) Run(stopCh <-chan struct{}) {
 	var wg wait.Group
 	defer wg.Wait()
 
+	//Reflector.Run主要执行了ListAndWatch的方法，将etcd的事件保存到本地Store中即Delta Fifo中
 	wg.StartWithChannel(stopCh, r.Run)
 
+	//将本地Store即Delta Fifo中的事件，调用informer.Controller.Process处理函数处理事件
 	wait.Until(c.processLoop, time.Second, stopCh)
 }
 
@@ -176,6 +195,7 @@ func (c *controller) LastSyncResourceVersion() string {
 // also be helpful.
 func (c *controller) processLoop() {
 	for {
+		//从Store即DeltaFifo中弹出元素，并调用informer controller 处理器对应处理
 		obj, err := c.config.Queue.Pop(PopProcessFunc(c.config.Process))
 		if err != nil {
 			if err == ErrFIFOClosed {

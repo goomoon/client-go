@@ -285,9 +285,12 @@ func WaitForCacheSync(stopCh <-chan struct{}, cacheSyncs ...InformerSynced) bool
 // sharedProcessor, which is responsible for relaying those
 // notifications to each of the informer's clients.
 type sharedIndexInformer struct {
-	indexer    Indexer
+	indexer Indexer
+
+	//对应的controller，其内部指向的ListerWatcher为 [listerWatcher]字段所引用值
 	controller Controller
 
+	//监听到事件之后的处理器，包括同步处理器列表和异步处理器列表
 	processor             *sharedProcessor
 	cacheMutationDetector MutationDetector
 
@@ -365,22 +368,38 @@ func (s *sharedIndexInformer) SetWatchErrorHandler(handler WatchErrorHandler) er
 	return nil
 }
 
+/**
+  开始启动share_informer
+*/
 func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 
+	//1. 创建队列
 	fifo := NewDeltaFIFOWithOptions(DeltaFIFOOptions{
 		KnownObjects:          s.indexer,
 		EmitDeltaTypeReplaced: true,
 	})
 
+	//构造controller配置
 	cfg := &Config{
-		Queue:            fifo,
+		//设置队列
+		Queue: fifo,
+
+		//设置ListWatch接口
 		ListerWatcher:    s.listerWatcher,
 		ObjectType:       s.objectType,
 		FullResyncPeriod: s.resyncCheckPeriod,
 		RetryOnError:     false,
 		ShouldResync:     s.processor.shouldResync,
 
+		/**
+		  设置处理器，将refelect变更事件封装成通知添加到转发到informer.processor上，而后者将其添加到各个listener的addChan队列中；
+		  整个处理过程如下：
+		  1. refelect是由informer controller所初始化用于跟etcd做交付，将etcd watch的事件保存到本地Store即Delta Fifo中
+		  2. 然后由该controller将refelect事件添加到informer.processor下面的listener的addChan队列中
+		  3. 然后有另外的协程负责将listenter addChan队列数据弹出放到listener nextChan队列中；
+		  4. 有另外协程负责取出listener nextChan队列数据，调用listener下面的handler处理业务(其由各个CustomController注入)
+		*/
 		Process:           s.HandleDeltas,
 		WatchErrorHandler: s.watchErrorHandler,
 	}
@@ -389,6 +408,7 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 		s.startedLock.Lock()
 		defer s.startedLock.Unlock()
 
+		//构造controller
 		s.controller = New(cfg)
 		s.controller.(*controller).clock = s.clock
 		s.started = true
@@ -399,7 +419,11 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 	var wg wait.Group
 	defer wg.Wait()              // Wait for Processor to stop
 	defer close(processorStopCh) // Tell Processor to stop
+
+	//调用s.cacheMutationDetector.Run，检查缓存对象是否变化。检查缓存的对象和复制的对象，是否有差异？
 	wg.StartWithChannel(processorStopCh, s.cacheMutationDetector.Run)
+
+	//调用informer.processor.run，其每个listern起一个协程，然后调用Listener.run和Listener.pop，执行处理channel队列的函数。（3、4 步骤）
 	wg.StartWithChannel(processorStopCh, s.processor.run)
 
 	defer func() {
@@ -407,6 +431,11 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 		defer s.startedLock.Unlock()
 		s.stopped = true // Don't want any new listeners
 	}()
+
+	/**
+	1. 调用sharedIndexInformer所属的Controller方法，构建Reflector，进行对etcd的缓存；将对应的对象变更时间添加到store中;
+	2. 调用informer controller上面挂的Process处理器(前面配置的)，其将store中的变更事件，添加到informer.listener中的addChan队列中
+	*/
 	s.controller.Run(stopCh)
 }
 
@@ -524,6 +553,9 @@ func (s *sharedIndexInformer) AddEventHandlerWithResyncPeriod(handler ResourceEv
 	}
 }
 
+/**
+默认处理方式：包装成notify事件，提交给informer.processor，后者添加到各个listener的channel队列中
+*/
 func (s *sharedIndexInformer) HandleDeltas(obj interface{}) error {
 	s.blockDeltas.Lock()
 	defer s.blockDeltas.Unlock()
@@ -578,7 +610,9 @@ func (s *sharedIndexInformer) HandleDeltas(obj interface{}) error {
 type sharedProcessor struct {
 	listenersStarted bool
 	listenersLock    sync.RWMutex
-	listeners        []*processorListener
+	//非同步事件的监听器如添加、更新、删除等增量事件
+	listeners []*processorListener
+	//同步事件的监听器即sync事件
 	syncingListeners []*processorListener
 	clock            clock.Clock
 	wg               wait.Group
@@ -604,6 +638,7 @@ func (p *sharedProcessor) distribute(obj interface{}, sync bool) {
 	p.listenersLock.RLock()
 	defer p.listenersLock.RUnlock()
 
+	//是否是同步事件
 	if sync {
 		for _, listener := range p.syncingListeners {
 			listener.add(obj)
@@ -620,11 +655,15 @@ func (p *sharedProcessor) run(stopCh <-chan struct{}) {
 		p.listenersLock.RLock()
 		defer p.listenersLock.RUnlock()
 		for _, listener := range p.listeners {
+			//新协程：每隔一分钟，处理一次该listener里面的next chan队列里面的notify事件，对应update、add、del调用hanlder的不同方法(OnUpdate、OnAdd、OnDel)
 			p.wg.Start(listener.run)
+			//新协程：一个一个将addCh里面的元素弹出，放到nextCh列表中
 			p.wg.Start(listener.pop)
 		}
 		p.listenersStarted = true
 	}()
+
+	//关闭处理操作
 	<-stopCh
 	p.listenersLock.RLock()
 	defer p.listenersLock.RUnlock()
@@ -678,9 +717,18 @@ func (p *sharedProcessor) resyncCheckPeriodChanged(resyncCheckPeriod time.Durati
 // processorListener also keeps track of the adjusted requested resync
 // period of the listener.
 type processorListener struct {
+	//run函数，每次从这里取notify事件数据进行处理
 	nextCh chan interface{}
-	addCh  chan interface{}
 
+	//新增的notify事件(内部包含增删改等事件)，对口updateNotification/addNotification/deleteNotification等结构体/Users/goomoon/go/src/k8s.io/client-go/tools/cache/shared_informer.go:283
+	addCh chan interface{}
+
+	//资源事件处理器，针对nextCh的事件，根据事件类型一次调用该Handler里面的函数，而该handler一般是各个业务CustomController在创建Informer时传入进来
+	/**
+		其中具体的实现函数handler是在NewDeploymentController（其他不同类型的controller类似）中赋值的，
+	    以下以DeploymentController的处理逻辑为例。
+	    在NewDeploymentController部分会注册deployment的事件函数，以下注册了三种类型的事件函数，其中包括：dInformer、rsInformer和podInformer。
+	*/
 	handler ResourceEventHandler
 
 	// pendingNotifications is an unbounded ring buffer that holds all notifications not yet distributed.
@@ -715,8 +763,9 @@ type processorListener struct {
 
 func newProcessListener(handler ResourceEventHandler, requestedResyncPeriod, resyncPeriod time.Duration, now time.Time, bufferSize int) *processorListener {
 	ret := &processorListener{
-		nextCh:                make(chan interface{}),
-		addCh:                 make(chan interface{}),
+		nextCh: make(chan interface{}),
+		addCh:  make(chan interface{}),
+		//业务处理逻辑封装，各个Custom Controller即是注入业务处理器到此
 		handler:               handler,
 		pendingNotifications:  *buffer.NewRingGrowing(bufferSize),
 		requestedResyncPeriod: requestedResyncPeriod,
@@ -732,6 +781,9 @@ func (p *processorListener) add(notification interface{}) {
 	p.addCh <- notification
 }
 
+/**
+一个一个将addCh里面的元素弹出，放到nextCh列表中
+*/
 func (p *processorListener) pop() {
 	defer utilruntime.HandleCrash()
 	defer close(p.nextCh) // Tell .run() to stop
@@ -762,6 +814,9 @@ func (p *processorListener) pop() {
 	}
 }
 
+/**
+每隔一分钟，处理一次该listener里面的next chan队列里面的notify事件，对应update、add、del调用hanlder的不同方法(OnUpdate、OnAdd、OnDel)
+*/
 func (p *processorListener) run() {
 	// this call blocks until the channel is closed.  When a panic happens during the notification
 	// we will catch it, **the offending item will be skipped!**, and after a short delay (one second)

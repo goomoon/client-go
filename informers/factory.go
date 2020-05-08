@@ -132,6 +132,7 @@ func (f *sharedInformerFactory) Start(stopCh <-chan struct{}) {
 
 	for informerType, informer := range f.informers {
 		if !f.startedInformers[informerType] {
+			//注意，每个Informer类型对应一个独立协程，一个独立的Reflector + Store + Informer + Informer.Controller 一套处理机制
 			go informer.Run(stopCh)
 			f.startedInformers[informerType] = true
 		}

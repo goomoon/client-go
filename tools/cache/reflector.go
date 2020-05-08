@@ -45,6 +45,10 @@ import (
 
 const defaultExpectedTypeName = "<unspecified>"
 
+/**
+  Reflector的主要作用是watch指定的k8s资源，并将变化同步到本地是store中。Reflector只会放置指定的expectedType类型的资源到store中，
+  除非expectedType为nil。如果resyncPeriod不为零，那么Reflector为以resyncPeriod为周期定期执行list的操作，这样就可以使用Reflector来定期处理所有的对象，也可以逐步处理变化的对象。
+*/
 // Reflector watches a specified resource and causes all changes to be reflected in the given store.
 type Reflector struct {
 	// name identifies this reflector. By default it will be a file:line if possible.
@@ -62,14 +66,15 @@ type Reflector struct {
 	expectedType reflect.Type
 	// The GVK of the object we expect to place in the store if unstructured.
 	expectedGVK *schema.GroupVersionKind
-	// The destination to sync up with the watch source
+	// The destination to sync up with the watch source.即informer.store即Delta Fifo队列
 	store Store
-	// listerWatcher is used to perform lists and watches.
+	// listerWatcher is used to perform lists and watches.list和watch的接口。
 	listerWatcher ListerWatcher
 
 	// backoff manages backoff of ListWatch
 	backoffManager wait.BackoffManager
 
+	// resync的周期，当非零的时候，会按该周期执行list。
 	resyncPeriod time.Duration
 	// ShouldResync is invoked periodically and whenever it returns `true` the Store's Resync operation is invoked
 	ShouldResync func() bool
@@ -80,7 +85,7 @@ type Reflector struct {
 	paginatedResult bool
 	// lastSyncResourceVersion is the resource version token last
 	// observed when doing a sync with the underlying store
-	// it is thread safe, but not synchronized with the underlying store
+	// it is thread safe, but not synchronized with the underlying store.最新一次看到的资源的版本号，主要在watch时候使用。
 	lastSyncResourceVersion string
 	// isLastSyncResourceVersionGone is true if the previous list or watch request with lastSyncResourceVersion
 	// failed with an HTTP 410 (Gone) status code.
@@ -236,6 +241,11 @@ func (r *Reflector) resyncChan() (<-chan time.Time, func() bool) {
 	return t.C(), t.Stop
 }
 
+/**
+ListAndWatch第一次会列出所有的对象，并获取资源对象的版本号，然后watch资源对象的版本号来查看是否有被变更。
+首先会将资源版本号设置为0，list()可能会导致本地的缓存相对于etcd里面的内容存在延迟，
+Reflector会通过watch的方法将延迟的部分补充上，使得本地的缓存数据与etcd的数据保持一致。
+*/
 // ListAndWatch first lists all items and get the resource version at the moment of call,
 // and then use the resource version to watch.
 // It returns error if ListAndWatch didn't even try to initialize watch.
@@ -260,7 +270,7 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 				}
 			}()
 			// Attempt to gather list in chunks, if supported by listerWatcher, if not, the first
-			// list request will return the full response.
+			// list request will return the full response.调用list接口
 			pager := pager.New(pager.SimplePageFunc(func(opts metav1.ListOptions) (runtime.Object, error) {
 				return r.listerWatcher.List(opts)
 			}))
@@ -330,17 +340,23 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 		if err != nil {
 			return fmt.Errorf("unable to understand list result %#v: %v", list, err)
 		}
+		//获取资源版本号
 		resourceVersion = listMetaInterface.GetResourceVersion()
 		initTrace.Step("Resource version extracted")
+		//将list内容，提取成对象列表
 		items, err := meta.ExtractList(list)
 		if err != nil {
 			return fmt.Errorf("unable to understand list result %#v (%v)", list, err)
 		}
 		initTrace.Step("Objects extracted")
+
+		//将list中对象列表的内容和版本号存储到本地的缓存store中，并全量替换已有的store的内容。
 		if err := r.syncWith(items, resourceVersion); err != nil {
 			return fmt.Errorf("unable to sync list result: %v", err)
 		}
 		initTrace.Step("SyncWith done")
+
+		//最后设置最新的资源版本号。
 		r.setLastSyncResourceVersion(resourceVersion)
 		initTrace.Step("Resource version updated")
 		return nil
@@ -352,12 +368,14 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 	cancelCh := make(chan struct{})
 	defer close(cancelCh)
 	go func() {
+		//基于resyncPeriod，设置同步定时器，定时同步列表Key
 		resyncCh, cleanup := r.resyncChan()
 		defer func() {
 			cleanup() // Call the last one written into cleanup
 		}()
 		for {
 			select {
+			//接收到定时器堵塞返回
 			case <-resyncCh:
 			case <-stopCh:
 				return
@@ -366,12 +384,14 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 			}
 			if r.ShouldResync == nil || r.ShouldResync() {
 				klog.V(4).Infof("%s: forcing resync", r.name)
+				//触发同步，各个Key做同步
 				if err := r.store.Resync(); err != nil {
 					resyncerrc <- err
 					return
 				}
 			}
 			cleanup()
+			//重置同步定时器
 			resyncCh, cleanup = r.resyncChan()
 		}
 	}()
@@ -386,6 +406,7 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 
 		timeoutSeconds := int64(minWatchTimeout.Seconds() * (rand.Float64() + 1.0))
 		options = metav1.ListOptions{
+			//最新的资源版本号，watch在此之后的事件
 			ResourceVersion: resourceVersion,
 			// We want to avoid situations of hanging watchers. Stop any wachers that do not
 			// receive any events within the timeout window.
@@ -398,6 +419,7 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 
 		// start the clock before sending the request, since some proxies won't flush headers until after the first watch event is sent
 		start := r.clock.Now()
+		//执行watch操作，获取一个watch 事件通知(内部实现为channel)
 		w, err := r.listerWatcher.Watch(options)
 		if err != nil {
 			// If this is "connection refused" error, it means that most likely apiserver is not responsive.
@@ -411,6 +433,7 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 			return err
 		}
 
+		//watchHandler主要是通过watch的方式保证当前的资源版本是最新的。
 		if err := r.watchHandler(start, w, &resourceVersion, resyncerrc, stopCh); err != nil {
 			if err != errorStopRequested {
 				switch {
@@ -452,6 +475,7 @@ loop:
 			return errorStopRequested
 		case err := <-errc:
 			return err
+			//循环获取watch到的变更事件
 		case event, ok := <-w.ResultChan():
 			if !ok {
 				break loop
@@ -476,6 +500,7 @@ loop:
 				utilruntime.HandleError(fmt.Errorf("%s: unable to understand watch event %#v", r.name, event))
 				continue
 			}
+			//获取最新版本号，并按增删改查事件更新本地缓存
 			newResourceVersion := meta.GetResourceVersion()
 			switch event.Type {
 			case watch.Added:
@@ -501,6 +526,8 @@ loop:
 			default:
 				utilruntime.HandleError(fmt.Errorf("%s: unable to understand watch event %#v", r.name, event))
 			}
+
+			//更新最新版本号
 			*resourceVersion = newResourceVersion
 			r.setLastSyncResourceVersion(newResourceVersion)
 			eventCount++
